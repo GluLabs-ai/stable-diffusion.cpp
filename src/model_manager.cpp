@@ -1042,17 +1042,26 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     }
     // GluRun: on the Hexagon NPU (ggml-hexagon, device "HTP<n>") quantized matmuls run only on
     // weights in its repack buffer (the device's extra buffer type), which lays Q4_0/Q4_1/Q8_0/
-    // IQ4_NL/MXFP4 out for the HVX/HMX kernels; from the default buffer they fall back to the CPU.
+    // IQ4_NL/MXFP4 and the ternary Q2_0/Q1_0 out for the HVX/HMX kernels; from the default buffer
+    // they fall back to the CPU.
     // Plain 2D weights of those types (not read by GET_ROWS: repacked data is not row-addressable)
     // go there. Every other weight stays in CPU memory: the NPU runs no other op on weights
     // (GGML_HEXAGON_MM_QUANT_ONLY), and the DSP's address space is small: with all of Bonsai
     // Image mapped (Q4_0 transformer + Qwen3-4B), fastrpc_mmap failed after ~1.2 GB on the v73.
+    // The type list must track ggml_hexagon_is_repack_type(): Q2_0 / Q1_0 were left out of it when
+    // the ternary tiles were ported (ggml-0004), so every Q2_0 linear of a Bonsai Image
+    // transformer was placed in CPU memory and the HTP claimed none of them. The row must hold
+    // whole ggml blocks (32, or 64 for Q2_0 and 128 for Q1_0), which is what the backend's
+    // ggml_hexagon_supported_mul_mat asks of src0.
     if (state.compute_backend != nullptr && state.params_backend == state.compute_backend && state.tensor != nullptr) {
         ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
         if (compute_dev != nullptr && std::string(ggml_backend_dev_name(compute_dev)).rfind("HTP", 0) == 0) {
             const ggml_type t = state.tensor->type;
-            const bool repackable = state.usage_op == GGML_OP_NONE && ggml_n_dims(state.tensor) == 2 && state.tensor->ne[0] % 32 == 0 &&
-                                    (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_MXFP4);
+            const bool repack_type = t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q8_0 ||
+                                     t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_MXFP4 ||
+                                     t == GGML_TYPE_Q2_0 || t == GGML_TYPE_Q1_0;
+            const bool repackable = state.usage_op == GGML_OP_NONE && ggml_n_dims(state.tensor) == 2 && repack_type &&
+                                    state.tensor->ne[0] % ggml_blck_size(t) == 0;
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(compute_dev);
             auto get_extra = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts")
                                  : nullptr;
