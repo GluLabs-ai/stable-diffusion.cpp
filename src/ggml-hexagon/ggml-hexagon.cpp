@@ -1713,7 +1713,10 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     char session_uri[256];
     {
         char htp_uri[256];
-        snprintf(htp_uri, sizeof(htp_uri), "file:///libggml-htp-v%u.so?htp_iface_skel_handle_invoke&_modver=1.0", opt_arch);
+        // GluRun: the image engine's own DSP skels (built from this tree by scripts/build-hexagon-sd.ps1)
+        // ship as libglurun_sd_htp-v7x.so, next to the core's libggml-htp-v7x.so from llama.cpp's
+        // tree, whose op messages differ: the two must not load each other's skel
+        snprintf(htp_uri, sizeof(htp_uri), "file:///libglurun_sd_htp-v%u.so?htp_iface_skel_handle_invoke&_modver=1.0", opt_arch);
 
         struct remote_rpc_get_uri u = {};
         u.session_id      = this->session_id;
@@ -4059,6 +4062,35 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
         return false;
+    }
+
+    // GluRun: GGML_HEXAGON_MM_QUANT_ONLY=1 claims only matmuls with repackable quantized weights
+    // (and the no-op view ops). The image engine sets it: on the Hexagon v73 (OnePlus CPH2585) an
+    // f16 x f16 matmul of the VAE's shape made the DSP queue fail (dspqueue_read 0x2e, then
+    // GGML_ABORT) and f32 attention ran 4-5x slower than the CPU, while Q4_0 / Q8_0 matmuls ran
+    // 35-50x faster than the CPU and correct.
+    {
+        static const bool mm_quant_only = [] {
+            const char * e = getenv("GGML_HEXAGON_MM_QUANT_ONLY");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (mm_quant_only) {
+            switch (op->op) {
+                case GGML_OP_NONE:
+                case GGML_OP_RESHAPE:
+                case GGML_OP_VIEW:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                    break;
+                case GGML_OP_MUL_MAT:
+                    if (!ggml_hexagon_is_repack_type(op->src[0]->type)) {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;
+            }
+        }
     }
 
     // all srcs & dsts must be mapped to the same session
