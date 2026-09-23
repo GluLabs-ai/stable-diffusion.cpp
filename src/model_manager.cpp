@@ -399,9 +399,21 @@ bool ModelManager::load_all_params_eagerly() {
     std::vector<TensorState*> all_states;
     all_states.reserve(tensor_states_.size());
     for (const auto& s : tensor_states_) {
-        if (s != nullptr) {
-            all_states.push_back(s.get());
+        if (s == nullptr) {
+            continue;
         }
+        // GluRun: a module assigned to the "disk" params backend (params_backend "te=disk": the
+        // text encoder's weights are read for a prompt encode and released right after it) is by
+        // definition read on demand, so reading it here defeats the assignment. Before this, an
+        // eager load of FLUX.2 Klein read the whole 2.4 GB Qwen3-4B encoder once even though the
+        // first thing that happens to it afterwards is being freed, and the peak RSS of the run
+        // was that load (docs/FOLLOWUPS.md item 61). Everything that does stay in RAM is still
+        // read now, so a bad file or too little memory still fails the load and not the first
+        // generation.
+        if (s->residency_mode == ResidencyMode::Disk) {
+            continue;
+        }
+        all_states.push_back(s.get());
     }
     return load_tensors_to_params_backend(all_states);
 }
