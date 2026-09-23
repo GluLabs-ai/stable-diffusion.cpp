@@ -1,3 +1,12 @@
+// GluRun: the quantized weight unpacking below is written with 32-bit integer ops only (no
+// unpack8 to 8-bit vectors, no int8_t/uint8_t temporaries), so the SPIR-V of matmul_<quant>_*
+// carries no 8-bit integer arithmetic. The Qualcomm Adreno driver (Adreno 740, 512.8xx) fails
+// vkCreateComputePipeline with ErrorUnknown for matmul_q4_0/q8_0/q4_k/q6_k built the upstream
+// way (the GluRun SDK's engines/llamacpp/patches/0008 found the same for llama.cpp's module).
+// Same values on every device.
+uvec4 glurun_unpack8u(uint x) { return uvec4(x & 0xFFu, (x >> 8) & 0xFFu, (x >> 16) & 0xFFu, x >> 24); }
+ivec2 glurun_unpack8i2(int x) { return ivec2(bitfieldExtract(x, 0, 8), bitfieldExtract(x, 8, 8)); }
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -61,8 +70,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = float(data_a_packed16[ib].d);
             const uint vui = uint(data_a_packed16[ib].qs[2*iqs]) | (uint(data_a_packed16[ib].qs[2*iqs + 1]) << 16);
-            const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
-            const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
+            const vec4 v0 = (vec4(glurun_unpack8u(vui & 0x0F0F0F0F)) - 8.0f) * d;
+            const vec4 v1 = (vec4(glurun_unpack8u((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(v0.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(v0.zw);
@@ -77,8 +86,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const vec2 dm = vec2(data_a_packed32[ib].dm);
             const uint vui = data_a_packed32[ib].qs[iqs];
-            const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * dm.x + dm.y;
-            const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
+            const vec4 v0 = vec4(glurun_unpack8u(vui & 0x0F0F0F0F)) * dm.x + dm.y;
+            const vec4 v1 = vec4(glurun_unpack8u((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
 
             buf_a[buf_idx     ] = FLOAT_TYPEV2(v0.xy);
             buf_a[buf_idx + 1 ] = FLOAT_TYPEV2(v0.zw);
@@ -131,8 +140,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint iqs = idx & 0x07;
 
             const float d = float(data_a_packed16[ib].d);
-            const i8vec2 v0 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs])).xy; // vec4 used due to #12147
-            const i8vec2 v1 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs + 1])).xy;
+            const ivec2 v0 = glurun_unpack8i2(int(data_a_packed16[ib].qs[2*iqs]));
+            const ivec2 v1 = glurun_unpack8i2(int(data_a_packed16[ib].qs[2*iqs + 1]));
             const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
@@ -174,7 +183,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint scalesi = iqs / 8;                      // 0..15
             const uint qsshift = ((iqs % 64) / 16) * 2;        // 0,2,4,6
 
-            const vec4 qs = vec4(unpack8((data_a_packed32[ib].qs[qsi / 2] >> qsshift) & 0x03030303));
+            const vec4 qs = vec4(glurun_unpack8u((data_a_packed32[ib].qs[qsi / 2] >> qsshift) & 0x03030303));
             const uint scales = data_a[ib].scales[scalesi];
             const vec2 dm = vec2(data_a[ib].dm);
 
@@ -197,12 +206,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint halfsplit = ((iqs % 64) / 16);    // 0,1,2,3
             const uint qsshift = halfsplit * 2;          // 0,2,4,6
 
-            const int8_t us = int8_t(((data_a[ib].scales[is % 8] >> (4 * int(is / 8))) & 0xF)
+            const int us = int(((data_a[ib].scales[is % 8] >> (4 * int(is / 8))) & 0xF)
                                   | (((data_a[ib].scales[8 + (is % 4)] >> (2 * int(is / 4))) & 3) << 4));
             const float dl = float(data_a[ib].d) * float(us - 32);
 
-            const vec2 qs = vec2(unpack8((uint(data_a_packed16[ib].qs[qsi / 2]) >> qsshift) & 0x0303).xy);
-            const vec2 hm = vec2(unpack8(((uint(data_a_packed16[ib].hmask[hmi / 2]) >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy);
+            const vec2 qs = vec2(glurun_unpack8u((uint(data_a_packed16[ib].qs[qsi / 2]) >> qsshift) & 0x0303).xy);
+            const vec2 hm = vec2(glurun_unpack8u(((uint(data_a_packed16[ib].hmask[hmi / 2]) >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy);
 
             buf_a[buf_idx] = FLOAT_TYPEV2(dl * (qs.x - hm.x),
                                           dl * (qs.y - hm.y));
@@ -232,13 +241,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
             const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
 
-            const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-            const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+            const uint sc    = uint(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
+            const uint mbyte = uint(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
 
-            const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
+            const vec4 q = vec4(glurun_unpack8u((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
@@ -269,15 +278,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
             const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
 
-            const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-            const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+            const uint sc    = uint(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
+            const uint mbyte = uint(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
-            const vec4 q = vec4(unpack8(qs | qh));
+            const vec4 q = vec4(glurun_unpack8u(qs | qh));
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
@@ -296,11 +305,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint qsi = n * 32 + (iqs % 32);       // 0..63
             const uint qhi = n * 16 + (iqs % 16);       // 0..31
 
-            const float dscale = float(data_a[ib].d) * float(data_a[ib].scales[is]);
+            const float dscale = float(data_a[ib].d) * float(bitfieldExtract(int(data_a_packed16[ib].scales[is / 2]), int(8 * (is & 1)), 8));
 
             const uint ql = (uint(data_a_packed16[ib].ql[qsi]) >> b) & 0x0F0F;
             const uint qh = (uint(data_a_packed16[ib].qh[qhi]) >> qhshift) & 0x0303;
-            const vec2 q = (vec2(unpack8(ql | (qh << 4)).xy) - 32) * dscale;
+            const vec2 q = (vec2(glurun_unpack8u(ql | (qh << 4)).xy) - 32) * dscale;
 
             buf_a[buf_idx] = FLOAT_TYPEV2(q.x, q.y);
 #elif defined(DATA_A_IQ1_S)

@@ -2859,6 +2859,16 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
                  disable_robustness << ", " << require_full_subgroups << ", " << required_subgroup_size << ")");
     GGML_ASSERT(parameter_count > 0);
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+    // GluRun: GGML_VK_LOG_PIPELINES=1 names every pipeline before the driver compiles it. On
+    // Qualcomm Adreno the shader compiler can crash inside vkCreateComputePipelines (SIGSEGV in
+    // libllvm-qgl.so) where no exception reaches ggml; the last line then names the culprit.
+    {
+        static const bool log_pipelines = getenv("GGML_VK_LOG_PIPELINES") != nullptr;
+        if (log_pipelines) {
+            fprintf(stderr, "ggml_vulkan: creating pipeline %s\n", pipeline->name.c_str());
+            fflush(stderr);
+        }
+    }
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
@@ -3938,6 +3948,17 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
+// GluRun: an integer environment switch of the Adreno selections, `def` when unset or unparsable.
+static int ggml_vk_adreno_env(const char * name, int def) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const long x = strtol(v, &end, 10);
+    return end != v ? (int) x : def;
+}
+
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     uint32_t lut_size = 0;
@@ -4882,7 +4903,25 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM_NODOT2(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && ggml_vk_adreno_env("GGML_VK_ADRENO_MM_REG", 1) != 0) {
+            // GluRun: Q2_0 x f32 on Qualcomm Adreno takes the register-tiled kernel of the GluRun SDK
+            // (kernels/vulkan/mul_mm_q2_0_adreno/mul_mm_q2_0_adreno.comp, copied in by engines/sd's
+            // configure): no shared memory, no specialisation constants, 8x4 outputs per thread.
+            // mul_mm.comp's Q2_0 path runs at ~38 GFLOPS on the Adreno 740, so one FLUX.2 Klein
+            // linear1 matmul (3072 x 27648 x 1536, 261 GFLOP) outlasts the driver's watchdog and the
+            // device is lost (vk::Queue::submit: ErrorDeviceLost); the core's llama.cpp measured this
+            // kernel at 415-460 GFLOPS. Same grid and push constants as matmul_q2_0_f32; one module
+            // for every tile slot. GGML_VK_ADRENO_MM_REG=0 selects mul_mm.comp again.
+            for (vk_matmul_pipeline * mp : {&device->pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f16acc,
+                                            &device->pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f32acc}) {
+                for (vk_pipeline * slot : {&(*mp)->l, &(*mp)->m, &(*mp)->s, &(*mp)->a_l, &(*mp)->a_m, &(*mp)->a_s}) {
+                    ggml_vk_create_pipeline(device, *slot, "mul_mm_q2_0_adreno_r3", mul_mm_q2_0_adreno_r3_len, mul_mm_q2_0_adreno_r3_data,
+                                            "main", 3, sizeof(vk_mat_mat_push_constants), {64, 32, 1}, {}, 1);
+                }
+            }
+        } else {
+            CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        }
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -6440,6 +6479,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            // GluRun: the Adreno driver's watchdog kills a command buffer that runs longer than a
+            // few seconds (vk::Queue::submit: ErrorDeviceLost on large batches, the GluRun SDK's
+            // kernels/README.md). Eight nodes per submit kept every measured LLM shape under it.
+            // GGML_VK_MAX_NODES_PER_SUBMIT still wins.
+            device->max_nodes_per_submit = 8;
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -10223,7 +10268,13 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
+               // GluRun: on Qualcomm Adreno only the mat-vec pipelines test-backend-ops passed
+               // (Adreno 740: f16, bf16, q2_0); mul_mat_vec_q8_0/q4_k/q6_k_f32_f32 fail in
+               // vkCreateComputePipeline and mul_mat_vec_f32_f32_f32 crashes the driver's shader
+               // compiler (SIGSEGV in libllvm-qgl.so). The others take the tiled matmul below.
+               (ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM ||
+                src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_Q2_0)) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
@@ -11601,11 +11652,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_topk_moe[idx][use_push];
         }
 
+        // GluRun: the 512-wide soft_max computes wrong rows on Qualcomm Adreno (Adreno 740,
+        // driver 512.676: test-backend-ops SOFT_MAX ne=[1280,1,12,1] ERR ~1.0; a decode over
+        // more than 1024 cached tokens lost the device). The subgroup-wide pipeline handles any
+        // row length and is correct there. Diffusion attention rows are 4096+ long (64x64 latent).
         if (src0->type == GGML_TYPE_F32 && (src1 == nullptr || src1->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
+            return src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
         }
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
+            return src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
         }
         return nullptr;
     case GGML_OP_SOFT_MAX_BACK:
@@ -17038,6 +17093,13 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     GGML_UNUSED(ctx);
+    // GluRun: the fused rms_norm+mul+rope shader miscomputes on Qualcomm Adreno drivers
+    // (Adreno 740, OnePlus CPH2585: test-backend-ops RMS_NORM_MUL_ROPE ERR ~2.0 / NaN for
+    // every multi-row case in rope modes 0 and 2; Qwen3 decodes to garbage). The unfused
+    // ops are correct there. The image engine's Qwen3 text encoder (FLUX.2 Klein) has the pattern.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+        return false;
+    }
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
     const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
     const ggml_tensor *rope = cgraph->nodes[node_idx + 2];
@@ -18123,6 +18185,21 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // GluRun: GGML_VK_DISABLE_OPS=SOFT_MAX,MUL_MAT,... (or ':'-separated) reports those ops (ggml_op_desc names, e.g.
+    // SILU for a unary op) unsupported, so ggml's scheduler runs them on the CPU: a bisection tool
+    // for a graph that computes wrong on one device.
+    {
+        static const std::string disabled = [] {
+            const char * e = getenv("GGML_VK_DISABLE_OPS");
+            std::string l = e ? "," + std::string(e) + "," : std::string();
+            for (auto & ch : l) if (ch == ':' || ch == '|') ch = ',';   // ':' where ',' separates env vars
+            return l;
+        }();
+        if (!disabled.empty() && disabled.find("," + std::string(ggml_op_desc(op)) + ",") != std::string::npos) {
+            return false;
+        }
+    }
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;

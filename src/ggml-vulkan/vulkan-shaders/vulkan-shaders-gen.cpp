@@ -874,6 +874,9 @@ void process_shaders() {
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+    // GluRun: the register-tiled Q2_0 x f32 matmul for Qualcomm Adreno (TM x TN outputs per thread);
+    // source: kernels/vulkan/mul_mm_q2_0_adreno/mul_mm_q2_0_adreno.comp in the GluRun SDK
+    string_to_spv("mul_mm_q2_0_adreno_r3", "mul_mm_q2_0_adreno.comp", {{"TM", "8"}, {"TN", "4"}});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
