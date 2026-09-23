@@ -1,0 +1,25 @@
+# GluRun SDK: what this ggml tree is.
+#
+# This is the `glurun/ggml` branch of https://github.com/GluLabs-ai/stable-diffusion.cpp -
+# leejet/ggml (the ggml fork stable-diffusion.cpp vendors) with GluRun's commits on top. It
+# lives in the stable-diffusion.cpp fork rather than in a fork of its own so that the image
+# engine needs one repository, not two: the `ggml` submodule of the `glurun/main` branch there
+# points back at the same URL with this branch's head, and `git submodule update --init
+# --recursive` gets both trees from one clone. The two histories are unrelated, exactly as
+# leejet/stable-diffusion.cpp and leejet/ggml are.
+#
+# engines/sd/CMakeLists.txt in the GluRun SDK reads this file out of the checkout and refuses
+# to configure if it is missing or if a feature the SDK needs is not listed; the message then
+# tells you to run `git submodule update --init --recursive`. No patches are applied at build
+# time (docs/BUILD.md "The image engine's base").
+#
+# Adding a change: commit it on this branch, add a feature= line here in the same commit, push,
+# then move the `ggml` gitlink on glurun/main, push that, and bump the SDK's submodule.
+branch=glurun/ggml
+fork=https://github.com/GluLabs-ai/stable-diffusion.cpp
+upstream=f583f393cd5dfdc129360bbf75cb3d49ccc837a8
+upstream_url=https://github.com/leejet/ggml
+feature=static-cpu-variants
+feature=vulkan-adreno
+feature=hexagon-own-skel-name
+feature=hexagon-q2_0-q1_0
