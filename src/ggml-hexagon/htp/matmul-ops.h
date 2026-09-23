@@ -25,6 +25,9 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088
 #define HTP_MM_WEIGHT_TILE_SIZE_IQ4_NL 576
 #define HTP_MM_WEIGHT_TILE_SIZE_MXFP4  544
+// GluRun ternary tiles (32 rows x 32 k), layout in hvx-mm-kernels-ternary.h: codes lane-major + fp16 row scales
+#define HTP_MM_WEIGHT_TILE_SIZE_Q2_0   320
+#define HTP_MM_WEIGHT_TILE_SIZE_Q1_0   192
 
 // --- Weight Repacked Aligned Tile Sizes ---
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
@@ -32,6 +35,8 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0   1152
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_IQ4_NL 640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q2_0   384
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q1_0   256
 
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -198,6 +203,10 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_TILE_SIZE_MXFP4;
+        case HTP_TYPE_Q2_0:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q2_0;
+        case HTP_TYPE_Q1_0:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q1_0;
         default:
             return 0;
     }
@@ -214,6 +223,10 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4;
+        case HTP_TYPE_Q2_0:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q2_0;
+        case HTP_TYPE_Q1_0:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q1_0;
         default:
             return 0;
     }
@@ -254,6 +267,8 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q8_0:
         case HTP_TYPE_MXFP4:
+        case HTP_TYPE_Q2_0:
+        case HTP_TYPE_Q1_0:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
         case HTP_TYPE_F16:
             return (size_t) k * sizeof(__fp16);
@@ -474,7 +489,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
     const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
                             wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
-                            wtype == HTP_TYPE_MXFP4);
+                            wtype == HTP_TYPE_MXFP4 ||
+                            wtype == HTP_TYPE_Q2_0 || wtype == HTP_TYPE_Q1_0);   // GluRun ternary tiles (ggml-0004)
 
     if (is_fused_qkv || is_fused_ffn) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);

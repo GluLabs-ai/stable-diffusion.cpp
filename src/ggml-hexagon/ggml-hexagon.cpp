@@ -207,10 +207,30 @@ static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const 
 
 // **
 
+// GluRun (engines/sd/patches/ggml-0004): Q2_0 (64-block ternary, codes 0..3 = q-1) and Q1_0 (128-block sign bits)
+// are stored on the DSP in their own 2-bit / 1-bit 32x32 tiles (htp/hvx-mm-kernels-ternary.h), ported from the
+// core llama.cpp tree's patch 0007.
+static inline bool ggml_hexagon_is_ternary_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q1_0;
+}
+
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
            type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
-           type == GGML_TYPE_MXFP4;
+           type == GGML_TYPE_MXFP4 || ggml_hexagon_is_ternary_type(type);
+}
+
+// Size of one repacked row in the DSP tiled layout. For the 32-element block types one 32x32 tile is exactly
+// ggml_row_size(type, 32); the ternary tiles are wider than the ggml rows they hold (Q2_0 320 vs 288 bytes per
+// 32 k of 32 rows, Q1_0 192 vs 144) because each tile carries an fp16 scale per row.
+static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type type, int64_t ne0) {
+    if (type == GGML_TYPE_Q2_0) {
+        return (size_t) (ne0 / 32) * HTP_MM_WEIGHT_TILE_SIZE_Q2_0 / 32;
+    }
+    if (type == GGML_TYPE_Q1_0) {
+        return (size_t) (ne0 / 32) * HTP_MM_WEIGHT_TILE_SIZE_Q1_0 / 32;
+    }
+    return ggml_row_size(type, ne0);
 }
 
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
@@ -606,6 +626,90 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t size) {
     GGML_UNUSED(size);
 }
 
+// The tile layout lives in ternary-tiles.h so the host test (tests/images/ternary_tile_test.cpp)
+// compiles the same code that packs the weights here.
+#include "ternary-tiles.h"
+
+static_assert(GGML_HEX_TERNARY_TILE_Q2_0 == HTP_MM_WEIGHT_TILE_SIZE_Q2_0, "ternary tile size out of sync");
+static_assert(GGML_HEX_TERNARY_TILE_Q1_0 == HTP_MM_WEIGHT_TILE_SIZE_Q1_0, "ternary tile size out of sync");
+
+// repack q2_0 / q1_0 data into the native tiled layout
+static void repack_ternary_tiled(ggml_tensor * t, const void * data, size_t size) {
+    const uint8_t * src_matrix = (const uint8_t *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    int n_col_tiles = ne1_padded / 32;
+    int n_k_tiles = ne0_padded / 32;
+    const size_t tile_size = ternary_tile_size(t->type == GGML_TYPE_Q2_0);
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+    const size_t row_size_bytes = ggml_row_size(t->type, ne0);
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            const uint8_t * src_expert = src_matrix + (i3 * ne2 + i2) * (size_t) ne1 * row_size_bytes;
+            uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            for (int ct = 0; ct < n_col_tiles; ct++) {
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    uint8_t * tile_dst = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                    memset(tile_dst, 0, tile_size);
+                    for (int row = 0; row < 32; row++) {
+                        int64_t r = ct * 32 + row;
+                        if (r < ne1 && kt < ne0 / 32) {
+                            ternary_tile_put_row(t->type == GGML_TYPE_Q2_0, tile_dst, row, src_expert + r * row_size_bytes, kt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
+// repack the native tiled layout back into q2_0 / q1_0 data (read-back only)
+static void repack_tiled_ternary(void * data, const ggml_tensor * t, size_t size) {
+    uint8_t * dst_matrix = (uint8_t *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    int n_col_tiles = ne1_padded / 32;
+    int n_k_tiles = ne0_padded / 32;
+    const size_t tile_size = ternary_tile_size(t->type == GGML_TYPE_Q2_0);
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+    const size_t row_size_bytes = ggml_row_size(t->type, ne0);
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            uint8_t * dst_expert = dst_matrix + (i3 * ne2 + i2) * (size_t) ne1 * row_size_bytes;
+            const uint8_t * matrix_src = (const uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            for (int ct = 0; ct < n_col_tiles; ct++) {
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    const uint8_t * tile_src = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                    for (int row = 0; row < 32; row++) {
+                        int64_t r = ct * 32 + row;
+                        if (r < ne1 && kt < ne0 / 32) {
+                            ternary_tile_get_row(t->type == GGML_TYPE_Q2_0, tile_src, row, dst_expert + r * row_size_bytes, kt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
 // repack q4_1 data into q4_1_tiled tensor
 static void repack_q4_1_tiled(ggml_tensor * t, const void * data, size_t size) {
     const block_q4_1 * src_matrix = (const block_q4_1 *) data;
@@ -971,6 +1075,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             repack_mxfp4_tiled(tensor, data, size);
             break;
 
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q1_0:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_ternary_tiled(tensor, data, size);
+            break;
+
         default:
             memcpy((char *) tensor->data + offset, data, size);
             break;
@@ -1016,6 +1127,13 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
             repack_tiled_mxfp4(data, tensor, size);
+            break;
+
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q1_0:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_tiled_ternary(data, tensor, size);
             break;
 
         default:
@@ -1094,12 +1212,12 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_1 || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_MXFP4) {
+    if (ggml_hexagon_is_repack_type(t->type)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
         int64_t ne2 = t->ne[2];
         int64_t ne3 = t->ne[3];
-        return ggml_row_size(t->type, ne0) * ne1 * ne2 * ne3;
+        return ggml_hexagon_tiled_row_size(t->type, ne0) * ne1 * ne2 * ne3;
     }
     return ggml_nbytes(t);
 
@@ -1249,7 +1367,7 @@ struct ggml_hexagon_opbatch {
             ne0 = hex_round_up(ne0, 32);
             ne1 = hex_round_up(ne1, 32);
         }
-        int64_t nb1 = is_repack ? ggml_row_size(t->type, ne0) : t->nb[1];
+        int64_t nb1 = is_repack ? ggml_hexagon_tiled_row_size(t->type, ne0) : t->nb[1];
         int64_t nb2 = is_repack ? nb1 * ne1 : t->nb[2];
         int64_t nb3 = is_repack ? nb2 * t->ne[2] : t->nb[3];
 
@@ -1297,7 +1415,7 @@ struct ggml_hexagon_opbatch {
             h.ne[3] = t->ne[3];
 
             h.nb[0] = t->nb[0];
-            h.nb[1] = ggml_row_size(t->type, h.ne[0]);
+            h.nb[1] = ggml_hexagon_tiled_row_size(t->type, h.ne[0]);
             h.nb[2] = h.nb[1] * h.ne[1];
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
@@ -2801,7 +2919,10 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-            if (src0->ne[0] % 32) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q1_0:
+            // GluRun ternary: the ggml block (64 / 128 k) must be whole, not only the 32-k tile
+            if (src0->ne[0] % ((src0->type == GGML_TYPE_Q2_0) ? QK2_0 : (src0->type == GGML_TYPE_Q1_0) ? QK1_0 : 32)) {
                 return false;
             }
 
@@ -4401,6 +4522,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_MXFP4 == (unsigned int) GGML_TYPE_MXFP4,
                   "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_Q2_0 == (unsigned int) GGML_TYPE_Q2_0,
+                  "please update hexagon type mapping");
+    static_assert((unsigned int) HTP_TYPE_Q1_0 == (unsigned int) GGML_TYPE_Q1_0,
+                  "please update hexagon type mapping");
     static_assert((unsigned int) HTP_TYPE_IQ4_NL == (unsigned int) GGML_TYPE_IQ4_NL,
                   "please update hexagon_type to match ggml_type");
 
