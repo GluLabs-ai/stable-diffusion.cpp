@@ -432,6 +432,57 @@ namespace sd::pipeline {
         return c;
     }
 
+    // GluRun: conditioning computed outside stable-diffusion.cpp. FLUX.2 Klein's text encoder is
+    // a Qwen3-4B prompt pass; the GluRun core runs the same GGUF through llama.cpp on the NPU or
+    // the GPU in 1-2 s where this tree's CPU pass takes 24-47 s on a phone (docs/FOLLOWUPS.md
+    // item 79). When a tensor is set here, prepare_image_generation_embeds returns it directly:
+    // the text encoder is not built, not paged in from disk and not run, so the runner-end guard
+    // in ..._uncached (which frees the disk-resident encoder) is never needed either.
+    // `dump_path` is the other direction: what this tree's own encoder produced, written to a
+    // file, so the two can be compared tensor for tensor.
+    struct GlurunPrecomputedConditioning {
+        bool               valid      = false;
+        bool               has_uncond = false;
+        int64_t            ne0        = 0;   // hidden (7680 for Klein: layers 9, 18, 27 of 2560)
+        int64_t            ne1        = 0;   // tokens (512 for Klein)
+        std::vector<float> cond;
+        std::vector<float> uncond;
+        std::string        dump_path;
+    };
+    static GlurunPrecomputedConditioning& glurun_precomputed_conditioning() {
+        static GlurunPrecomputedConditioning c;
+        return c;
+    }
+
+    // "GLCOND1\0", int32 n_tensors, then per tensor: int32 name_len, name, int32 ne0, int32 ne1,
+    // float data[ne0*ne1] (ggml order: token t starts at t*ne0). Little-endian, as the file is
+    // only read back by the tools in this repository.
+    static void glurun_dump_conditioning(const std::string& path, const ImageGenerationEmbeds& embeds) {
+        std::vector<std::pair<const char*, const sd::Tensor<float>*>> ts;
+        ts.push_back({"cond", &embeds.cond.c_crossattn});
+        if (!embeds.uncond.c_crossattn.empty()) ts.push_back({"uncond", &embeds.uncond.c_crossattn});
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            LOG_ERROR("conditioning dump: cannot write %s", path.c_str());
+            return;
+        }
+        fwrite("GLCOND1\0", 1, 8, f);
+        int32_t n = (int32_t)ts.size();
+        fwrite(&n, 4, 1, f);
+        for (auto& e : ts) {
+            int32_t len = (int32_t)strlen(e.first);
+            fwrite(&len, 4, 1, f);
+            fwrite(e.first, 1, (size_t)len, f);
+            int32_t ne0 = (int32_t)(e.second->dim() > 0 ? e.second->shape()[0] : 0);
+            int32_t ne1 = (int32_t)(e.second->dim() > 1 ? e.second->shape()[1] : 1);
+            fwrite(&ne0, 4, 1, f);
+            fwrite(&ne1, 4, 1, f);
+            fwrite(e.second->data(), sizeof(float), (size_t)e.second->numel(), f);
+            LOG_INFO("conditioning dump: %s [%lld, %lld] -> %s", e.first, (long long)ne0, (long long)ne1, path.c_str());
+        }
+        fclose(f);
+    }
+
     static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds_uncached(StableDiffusionGGML* sd,
                                                                                 const sd_img_gen_params_t* sd_img_gen_params,
                                                                                 GenerationRequest* request,
@@ -555,9 +606,31 @@ namespace sd::pipeline {
                                                                                 SamplePlan* plan,
                                                                                 ImageGenerationLatents* latents,
                                                                                 const RefImageParams& ref_image_params) {
+        GlurunPrecomputedConditioning& pre = glurun_precomputed_conditioning();
+        const bool plain_txt2img = latents->ref_images.empty() && !request->has_ref_images &&
+                                   sd_img_gen_params->ip_adapter_image.data == nullptr;
+        if (pre.valid && plain_txt2img) {
+            if (pre.ne0 <= 0 || pre.ne1 <= 0 || (int64_t)pre.cond.size() != pre.ne0 * pre.ne1) {
+                LOG_ERROR("precomputed conditioning: bad shape [%lld, %lld] for %lld floats",
+                          (long long)pre.ne0, (long long)pre.ne1, (long long)pre.cond.size());
+                return std::nullopt;
+            }
+            if (request->use_uncond && !pre.has_uncond) {
+                LOG_ERROR("precomputed conditioning: guidance needs a negative-prompt tensor and none was given");
+                return std::nullopt;
+            }
+            ImageGenerationEmbeds embeds;
+            embeds.cond.c_crossattn = sd::Tensor<float>({pre.ne0, pre.ne1}, pre.cond);
+            if (request->use_uncond) {
+                embeds.uncond.c_crossattn = sd::Tensor<float>({pre.ne0, pre.ne1}, pre.uncond);
+            }
+            LOG_INFO("get_learned_condition: precomputed [%lld, %lld]%s, text encoder not run",
+                     (long long)pre.ne0, (long long)pre.ne1, request->use_uncond ? " (+ uncond)" : "");
+            return embeds;
+        }
+
         GlurunConditionCache& cache = glurun_condition_cache();
-        const bool cacheable = cache.enabled && latents->ref_images.empty() && !request->has_ref_images &&
-                               sd_img_gen_params->ip_adapter_image.data == nullptr;
+        const bool cacheable = cache.enabled && plain_txt2img;
         std::string key;
         if (cacheable) {
             key = request->prompt + '' + request->negative_prompt + '' + std::to_string(request->clip_skip) + '' +
@@ -570,6 +643,9 @@ namespace sd::pipeline {
             }
         }
         auto embeds = prepare_image_generation_embeds_uncached(sd, sd_img_gen_params, request, plan, latents, ref_image_params);
+        if (embeds && !pre.dump_path.empty()) {
+            glurun_dump_conditioning(pre.dump_path, *embeds);
+        }
         if (cacheable && embeds) {
             cache.valid  = true;
             cache.ctx    = sd;
@@ -1118,4 +1194,46 @@ void sd_glurun_clear_condition_cache() {
     c.valid  = false;
     c.ctx    = nullptr;
     c.embeds = {};
+}
+
+// GluRun: conditioning computed by the core's llama.cpp engine (FOLLOWUPS 79). `cond` and, when
+// classifier-free guidance is on, `uncond` are ne0 x ne1 floats in ggml order (token t at
+// t*ne0). They are copied; the caller keeps ownership. uncond == nullptr: positive only, which
+// is what a Klein run at guidance 1 needs.
+void sd_glurun_set_precomputed_conditioning(const float* cond, long long ne0, long long ne1, const float* uncond) {
+    auto& c = sd::pipeline::glurun_precomputed_conditioning();
+    if (cond == nullptr || ne0 <= 0 || ne1 <= 0) {
+        c.valid      = false;
+        c.has_uncond = false;
+        c.cond.clear();
+        c.uncond.clear();
+        return;
+    }
+    const size_t n = (size_t)ne0 * (size_t)ne1;
+    c.ne0          = (int64_t)ne0;
+    c.ne1          = (int64_t)ne1;
+    c.cond.assign(cond, cond + n);
+    if (uncond != nullptr) {
+        c.uncond.assign(uncond, uncond + n);
+        c.has_uncond = true;
+    } else {
+        c.uncond.clear();
+        c.has_uncond = false;
+    }
+    c.valid = true;
+}
+
+void sd_glurun_clear_precomputed_conditioning() {
+    auto& c      = sd::pipeline::glurun_precomputed_conditioning();
+    c.valid      = false;
+    c.has_uncond = false;
+    c.ne0 = c.ne1 = 0;
+    c.cond.clear();
+    c.uncond.clear();
+}
+
+// Writes what this tree's own text encoder produced to `path` after every uncached encode, so a
+// run of the core's encoder can be compared against it (nullptr or "" switches it off).
+void sd_glurun_set_conditioning_dump(const char* path) {
+    sd::pipeline::glurun_precomputed_conditioning().dump_path = (path && *path) ? path : "";
 }
