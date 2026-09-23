@@ -28,6 +28,9 @@
 // Backend registry
 #ifdef GGML_USE_CPU
 #include "ggml-cpu.h"
+#ifdef GLURUN_GGML_CPU_REG
+extern "C" ggml_backend_reg_t GLURUN_GGML_CPU_REG(void);
+#endif
 #endif
 
 #ifdef GGML_USE_CUDA
@@ -169,7 +172,13 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_et_reg());
 #endif
 #ifdef GGML_USE_CPU
+#ifdef GLURUN_GGML_CPU_REG
+        // GluRun: the including project picks one of several statically linked CPU
+        // variants at runtime (GLURUN_GGML_EXTRA_CPU_VARIANTS in src/CMakeLists.txt)
+        register_backend(GLURUN_GGML_CPU_REG());
+#else
         register_backend(ggml_backend_cpu_reg());
+#endif
 #endif
     }
 

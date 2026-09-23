@@ -468,6 +468,31 @@ if (GGML_CPU_ALL_VARIANTS)
     endif()
 elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
+    # GluRun: extra CPU backends in a static (GGML_BACKEND_DL=OFF) build, one per
+    # "tag=march" entry of GLURUN_GGML_EXTRA_CPU_VARIANTS (targets ggml-cpu-<tag>).
+    # They define the same symbols as ggml-cpu: the including project must rename
+    # them (engines/sd/cmake/rename_cpu_variant.cmake in the GluRun SDK) and pick
+    # one at runtime through its own ggml_backend_cpu_reg().
+    if (NOT GGML_BACKEND_DL AND GLURUN_GGML_EXTRA_CPU_VARIANTS)
+        foreach (glurun_variant ${GLURUN_GGML_EXTRA_CPU_VARIANTS})
+            string(REPLACE "=" ";" glurun_kv "${glurun_variant}")
+            list(GET glurun_kv 0 glurun_tag)
+            list(GET glurun_kv 1 GGML_CPU_ARM_ARCH)
+            ggml_add_cpu_backend_variant_impl(${glurun_tag})
+            # every global symbol of the variant gets the prefix glurun_<tag>_, in place,
+            # right after the archive is written (same directory as the target)
+            add_custom_command(TARGET ggml-cpu-${glurun_tag} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DOBJCOPY=${CMAKE_OBJCOPY}
+                        -DLIB=$<TARGET_FILE:ggml-cpu-${glurun_tag}> -DPREFIX=glurun_${glurun_tag}_
+                        -P ${GLURUN_GGML_RENAME_SCRIPT}
+                VERBATIM)
+        endforeach()
+        unset(GGML_CPU_ARM_ARCH)   # back to the cache value for anything below
+    endif()
+    if (GLURUN_GGML_CPU_REG)
+        # the registry registers the CPU backend this function returns instead of ggml_backend_cpu_reg()
+        target_compile_definitions(ggml PRIVATE GLURUN_GGML_CPU_REG=${GLURUN_GGML_CPU_REG})
+    endif()
 endif()
 
 ggml_add_backend(BLAS)
