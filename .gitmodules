@@ -1,6 +1,9 @@
 [submodule "ggml"]
     path = ggml
-	url = https://github.com/leejet/ggml.git
+	# GluRun: leejet/ggml with our commits, kept as the branch glurun/ggml of this same
+	# repository (see .glurun-base). One clone therefore carries both trees.
+	url = https://github.com/GluLabs-ai/stable-diffusion.cpp.git
+	branch = glurun/ggml
 [submodule "examples/server/frontend"]
 	path = examples/server/frontend
 	url = https://github.com/leejet/sdcpp-webui.git

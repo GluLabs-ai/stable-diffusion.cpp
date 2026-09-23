@@ -1,0 +1,29 @@
+# GluRun SDK: what this stable-diffusion.cpp tree is.
+#
+# This is the `glurun/main` branch of https://github.com/GluLabs-ai/stable-diffusion.cpp -
+# leejet/stable-diffusion.cpp at the sha below with GluRun's commits on top, one per change.
+# engines/sd/stable-diffusion.cpp in the GluRun SDK is a submodule pinned to its head.
+#
+# The vendored ggml gets the same treatment, but without a second repository: .gitmodules here
+# points `ggml` back at this repository, branch `glurun/ggml` (leejet/ggml with our four
+# commits and a .glurun-base of its own). `git submodule update --init --recursive` therefore
+# gets both trees from one clone, and each side can still follow its own upstream with an
+# ordinary merge. The two histories in this repository are unrelated, exactly as
+# leejet/stable-diffusion.cpp and leejet/ggml are.
+#
+# engines/sd/CMakeLists.txt reads this file and the one in ggml/ at configure time and refuses
+# to build if either is missing or lacks a feature the SDK needs, with a message telling you to
+# run `git submodule update --init --recursive`. Nothing is patched at build time
+# (docs/BUILD.md "The image engine's base").
+#
+# Adding a change: commit it on this branch, add a feature= line here in the same commit, push,
+# then bump the submodule in the SDK and add the id to GLURUN_SD_BASE_FEATURES in
+# engines/sd/CMakeLists.txt if the SDK depends on it.
+branch=glurun/main
+fork=https://github.com/GluLabs-ai/stable-diffusion.cpp
+upstream=c678dfe704a2230342376b46add9c8ca736a653d
+upstream_url=https://github.com/leejet/stable-diffusion.cpp
+ggml_branch=glurun/ggml
+feature=gpu-placement-and-attention
+feature=precomputed-conditioning
+feature=lazy-disk-params
