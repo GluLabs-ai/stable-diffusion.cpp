@@ -998,6 +998,62 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     if (params_buft == nullptr) {
         params_buft = ggml_backend_get_default_buffer_type(state.params_backend);
     }
+    // GluRun: a weight the compute device cannot hold at all goes to a CPU buffer. ggml-vulkan
+    // refuses every tensor larger than its storage buffer limits (Qwen3-4B's 319 MB token
+    // embedding on an Adreno 740), and ggml's scheduler aborts the process on the first graph
+    // that reads such a weight from the device's buffer ("pre-allocated tensor ... in a buffer
+    // (Vulkan0) that cannot run the operation (NONE)"). From a CPU buffer the op that reads it
+    // runs on the CPU and only its (small) result moves to the device.
+    // (the same answer before and after the weight has its buffer: the check swaps in an empty
+    // buffer of the candidate type and puts the tensor's own back)
+    if (state.compute_backend != nullptr && state.params_backend == state.compute_backend && state.tensor != nullptr) {
+        ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
+        if (compute_dev != nullptr && ggml_backend_dev_type(compute_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_buffer_t own   = state.tensor->buffer;
+            ggml_backend_buffer_t probe = ggml_backend_buft_alloc_buffer(params_buft, 0);
+            bool                  holds = true;
+            if (probe != nullptr) {
+                state.tensor->buffer = probe;
+                holds                = ggml_backend_dev_supports_op(compute_dev, state.tensor);
+                state.tensor->buffer = own;
+                ggml_backend_buffer_free(probe);
+            }
+            if (!holds) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu_dev != nullptr) {
+                    if (own == nullptr) LOG_INFO("tensor '%s' (%.1f MB) does not fit %s's buffers: kept in CPU memory",
+                             state.name.c_str(), ggml_nbytes(state.tensor) / 1048576.0, ggml_backend_dev_name(compute_dev));
+                    return ggml_backend_dev_buffer_type(cpu_dev);
+                }
+            }
+        }
+    }
+    // GluRun: on the Hexagon NPU (ggml-hexagon, device "HTP<n>") quantized matmuls run only on
+    // weights in its repack buffer (the device's extra buffer type), which lays Q4_0/Q4_1/Q8_0/
+    // IQ4_NL/MXFP4 out for the HVX/HMX kernels; from the default buffer they fall back to the CPU.
+    // Plain 2D weights of those types (not read by GET_ROWS: repacked data is not row-addressable)
+    // go there. Every other weight stays in CPU memory: the NPU runs no other op on weights
+    // (GGML_HEXAGON_MM_QUANT_ONLY), and the DSP's address space is small: with all of Bonsai
+    // Image mapped (Q4_0 transformer + Qwen3-4B), fastrpc_mmap failed after ~1.2 GB on the v73.
+    if (state.compute_backend != nullptr && state.params_backend == state.compute_backend && state.tensor != nullptr) {
+        ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
+        if (compute_dev != nullptr && std::string(ggml_backend_dev_name(compute_dev)).rfind("HTP", 0) == 0) {
+            const ggml_type t = state.tensor->type;
+            const bool repackable = state.usage_op == GGML_OP_NONE && ggml_n_dims(state.tensor) == 2 && state.tensor->ne[0] % 32 == 0 &&
+                                    (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_MXFP4);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(compute_dev);
+            auto get_extra = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts")
+                                 : nullptr;
+            ggml_backend_buffer_type_t * extra = get_extra ? get_extra(compute_dev) : nullptr;
+            if (repackable && extra != nullptr && extra[0] != nullptr) {
+                return extra[0];
+            }
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev != nullptr) {
+                return ggml_backend_dev_buffer_type(cpu_dev);
+            }
+        }
+    }
     if (state.usage_op != GGML_OP_NONE &&
         state.compute_backend != nullptr) {
         ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);

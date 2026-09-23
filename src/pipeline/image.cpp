@@ -414,7 +414,25 @@ namespace sd::pipeline {
         return latents;
     }
 
-    static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(StableDiffusionGGML* sd,
+    // GluRun: one cached prompt encoding (the last one) per process. A new seed with the same
+    // prompt skips the text encoder entirely, which also means it is not reloaded when its
+    // weights are disk-resident (freed after each encode; GluRun's "free_text_encoder"). The
+    // cached tensors are the ones the encoder produced, so the image bytes do not change.
+    // Enabled by sd_glurun_set_condition_cache(1); used only without reference images, an
+    // IP-adapter image or generation extensions.
+    struct GlurunConditionCache {
+        bool enabled = false;
+        bool valid   = false;
+        const void* ctx = nullptr;
+        std::string key;
+        ImageGenerationEmbeds embeds;
+    };
+    static GlurunConditionCache& glurun_condition_cache() {
+        static GlurunConditionCache c;
+        return c;
+    }
+
+    static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds_uncached(StableDiffusionGGML* sd,
                                                                                 const sd_img_gen_params_t* sd_img_gen_params,
                                                                                 GenerationRequest* request,
                                                                                 SamplePlan* plan,
@@ -528,6 +546,36 @@ namespace sd::pipeline {
         embeds.cond       = std::move(cond);
         embeds.uncond     = std::move(uncond);
 
+        return embeds;
+    }
+
+    static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(StableDiffusionGGML* sd,
+                                                                                const sd_img_gen_params_t* sd_img_gen_params,
+                                                                                GenerationRequest* request,
+                                                                                SamplePlan* plan,
+                                                                                ImageGenerationLatents* latents,
+                                                                                const RefImageParams& ref_image_params) {
+        GlurunConditionCache& cache = glurun_condition_cache();
+        const bool cacheable = cache.enabled && latents->ref_images.empty() && !request->has_ref_images &&
+                               sd_img_gen_params->ip_adapter_image.data == nullptr;
+        std::string key;
+        if (cacheable) {
+            key = request->prompt + '' + request->negative_prompt + '' + std::to_string(request->clip_skip) + '' +
+                  std::to_string(request->width) + 'x' + std::to_string(request->height) + '' +
+                  std::to_string((int)request->use_uncond) + std::to_string((int)request->use_img_uncond) +
+                  std::to_string((int)request->use_high_noise_uncond);
+            if (cache.valid && cache.ctx == (const void*)sd && cache.key == key) {
+                LOG_INFO("get_learned_condition: cached (same prompt), text encoder not run");
+                return cache.embeds;
+            }
+        }
+        auto embeds = prepare_image_generation_embeds_uncached(sd, sd_img_gen_params, request, plan, latents, ref_image_params);
+        if (cacheable && embeds) {
+            cache.valid  = true;
+            cache.ctx    = sd;
+            cache.key    = key;
+            cache.embeds = *embeds;
+        }
         return embeds;
     }
 
@@ -1055,3 +1103,19 @@ namespace sd::pipeline {
     }
 
 }  // namespace sd::pipeline
+
+// GluRun: switch and reset for the conditioning cache above (called by libglurun_sd)
+void sd_glurun_set_condition_cache(int enabled) {
+    auto& c   = sd::pipeline::glurun_condition_cache();
+    c.enabled = enabled != 0;
+    if (!c.enabled) {
+        c.valid  = false;
+        c.embeds = {};
+    }
+}
+void sd_glurun_clear_condition_cache() {
+    auto& c  = sd::pipeline::glurun_condition_cache();
+    c.valid  = false;
+    c.ctx    = nullptr;
+    c.embeds = {};
+}

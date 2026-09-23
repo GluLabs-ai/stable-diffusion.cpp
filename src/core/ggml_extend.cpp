@@ -776,15 +776,55 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
 
-        auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_scale_inplace(ctx, kq, scale);
-        if (mask) {
-            kq = ggml_add_inplace(ctx, kq, mask);
-        }
-        kq = ggml_soft_max_inplace(ctx, kq);
+        auto attend = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in) {
+            auto kq = ggml_mul_mat(ctx, k_in, q_in);  // [heads, L_q, L_k]
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_scale_inplace(ctx, kq, scale);
+            if (mask) {
+                kq = ggml_add_inplace(ctx, kq, mask);
+            }
+            kq = ggml_soft_max_inplace(ctx, kq);
+            return ggml_mul_mat(ctx, v_in, kq);  // [heads, L_q, d_head]
+        };
 
-        kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
+        // GluRun: the score matrix [N * n_head, L_q, L_k] in f32 can be larger than a GPU backend
+        // accepts in one buffer (FLUX.2 Klein at 512x512: 1,536 tokens x 24 heads = 226 MB, past
+        // the Adreno 740's storage buffer range). ggml's scheduler then moves the attention to
+        // the CPU, and stable-diffusion.cpp's mixed GPU/CPU graphs computed noise or crashed on
+        // that phone. When the backend is a GPU that refuses the full matrix, the heads are
+        // attended in groups whose score matrix it accepts, and the results concatenated: the
+        // same arithmetic per head, the whole graph stays on the device. (Needs n_kv_head ==
+        // n_head and a mask shared by all heads; otherwise the single matrix as before.)
+        int64_t B     = n_head * N;
+        int64_t group = B;
+        if (backend != nullptr && !sd_backend_is_cpu(backend) && n_kv_head == n_head &&
+            (mask == nullptr || mask->ne[2] == 1) && q->ne[2] == B && k->ne[2] == B && v->ne[2] == B) {
+            auto fits = [&](int64_t g) {
+                ggml_tensor* kq = ggml_mul_mat(ctx, ggml_view_3d(ctx, k, d_head, L_k, g, k->nb[1], k->nb[2], 0),
+                                               ggml_view_3d(ctx, q, d_head, L_q, g, q->nb[1], q->nb[2], 0));
+                return ggml_backend_supports_op(backend, kq) && ggml_backend_supports_op(backend, ggml_soft_max(ctx, kq));
+            };
+            // only a size refusal is worth splitting: a backend that refuses even one head's
+            // matrix (the Hexagon NPU claims no f32 matmul at all) keeps the single matrix, which
+            // the scheduler runs elsewhere
+            if (!fits(group) && fits(1)) {
+                while (group > 1 && !fits(group)) {
+                    group = (group + 1) / 2;
+                }
+            }
+        }
+        if (group >= B) {
+            kqv = attend(q, k, v);
+        } else {
+            for (int64_t h0 = 0; h0 < B; h0 += group) {
+                int64_t g  = std::min(group, B - h0);
+                auto q_g   = ggml_view_3d(ctx, q, d_head, L_q, g, q->nb[1], q->nb[2], h0 * q->nb[2]);
+                auto k_g   = ggml_view_3d(ctx, k, d_head, L_k, g, k->nb[1], k->nb[2], h0 * k->nb[2]);
+                auto v_g   = ggml_view_3d(ctx, v, L_k, d_head, g, v->nb[1], v->nb[2], h0 * v->nb[2]);
+                auto out_g = attend(q_g, k_g, v_g);
+                kqv        = kqv == nullptr ? out_g : ggml_concat(ctx, kqv, out_g, 2);
+            }
+        }
 
         kqv = ggml_reshape_4d(ctx, kqv, d_head, L_q, n_head, N);  // [N, n_head, L_q, d_head]
         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                 // [N, L_q, n_head, d_head]

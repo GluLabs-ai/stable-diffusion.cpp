@@ -695,6 +695,14 @@ ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t dir
         if (!params_tensor_set_.count(tensor)) {
             return nullptr;
         }
+        // GluRun: a weight the model manager placed in CPU memory because the compute device
+        // cannot hold it (patches/sd-0001) is measured where it is, not in the device's buffer
+        if (tensor->buffer != nullptr && ggml_backend_buffer_is_host(tensor->buffer) && !sd_backend_is_cpu(runtime_backend)) {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev != nullptr && ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_dev_buffer_type(cpu_dev)) {
+                return nullptr;
+            }
+        }
         auto placement = graph_cut_layer_split_assignments_.find(tensor);
         return placement == graph_cut_layer_split_assignments_.end() ? runtime_backend : placement->second;
     };
